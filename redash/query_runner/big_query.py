@@ -2,6 +2,7 @@ import datetime
 import logging
 import sys
 import time
+import re
 from base64 import b64decode
 
 import httplib2
@@ -83,9 +84,41 @@ def _get_query_results(jobs, project_id, location, job_id, start_index):
     return query_reply
 
 
+ANNOTATION_RE = re.compile(r"^\/\*\s(.*)\s\*\/$", re.U | re.M)
+
+def _parse_annotated_query(query):
+    """
+    Parses the given query for the annotation that Redash left
+    there when before running the job.
+    E.g. a query that has the annotation on top::
+        /* Task ID: 8ccd40c878f59fa69ccf31a72140b208, Query Hash: f6bf37efedbc0a2dfffc1caf5088d86e, Query ID: 12345, Queue: celery, Username: jezdez */
+        SELECT * FROM users;
+    will lead to returning::
+        {
+            'Query Hash': 'f6bf37efedbc0a2dfffc1caf5088d86e',
+            'Query ID': '12345',
+            'Queue': 'celery',
+            'Task ID': '8ccd40c878f59fa69ccf31a72140b208',
+            'Username': 'jezdez',
+        }
+    which we can use as labels when submitting the BigQuery job.
+    """
+    if not query or "/*" not in query:
+        return {}
+    match = ANNOTATION_RE.match(query.strip())
+    if not match:
+        return {}
+    # Split by comma and colons to create a key/value dict of query annotations
+    return dict(map(lambda s: map(str.strip, s.split(":")), match.group(1).split(",")))
+
+
 class BigQuery(BaseQueryRunner):
-    should_annotate_query = False
     noop_query = "SELECT 1"
+
+    @classmethod
+    def annotate_query(cls):
+        """Needed so we can extract annotations from query for job labels"""
+        return True
 
     @classmethod
     def enabled(cls):
@@ -185,6 +218,16 @@ class BigQuery(BaseQueryRunner):
             job_data["configuration"]["query"][
                 "maximumBillingTier"
             ] = self.configuration["maximumBillingTier"]
+
+        # Reference: https://github.com/mozilla/redash-stmo/pull/38
+        parsed_annotation = _parse_annotated_query(query)
+        labels = {}
+
+        if "Query ID" in parsed_annotation:
+            labels["redash_query_id"] = parsed_annotation["Query ID"]
+
+        if len(labels) > 0:
+            job_data["labels"] = labels
 
         return job_data
 
